@@ -126,6 +126,7 @@ len_argv = len(sys.argv)
 driver_required_loading = False
 is_MST_installed = False
 is_MFT_installed = False
+mst_status_cache = {} # "mst status" / "mst status -v" output, reset in load_modules
 MFT_INSTALLED_MESSAGE = ""
 are_inband_cables_loaded = False # If in-band cables were loaded before user runs snapshot
 mst_devices_exist = False
@@ -477,6 +478,21 @@ def get_status_output(command, timeout='10'):
         error = "\nError while reading output from command - " + command_with_timeout + "\n"
         return 1, error
 
+def get_mst_status(verbose=False):
+    """ Run "mst status" / "mst status -v" once, then reuse the result. """
+    cmd = "mst status -v" if verbose else "mst status"
+    if cmd not in mst_status_cache:
+        mst_status_cache[cmd] = get_status_output(cmd)
+    return mst_status_cache[cmd]
+
+def get_mst_status_grep(verbose=False):
+    """ Same as "mst status [-v] | grep device_filter", from the cached output. """
+    st, out = get_mst_status(verbose)
+    if st != 0: # keep the old behavior when mst status fails
+        return get_status_output("mst status%s | grep '%s'" % (" -v" if verbose else "", device_filter))
+    lines = [line for line in (out.split("\n") if out else []) if device_filter in line]
+    return (SUCCESS_STATUS if lines else FAILED_STATUS), "\n".join(lines).strip()
+
 
 # Ditto but preserving the exit status.
 # Returns a pair (sts, output)
@@ -798,7 +814,7 @@ def update_net_devices():
 
     # e.g /dev/mst/mtusb-1                 - USB to I2C adapter as I2C master
     if mtusb_flag:
-        st, mst_status = get_status_output("mst status")
+        st, mst_status = get_mst_status()
         mtusbs = re.findall(r'(.*?)- USB', mst_status)
         for mtusb_device in mtusbs:
             mtusb_devices.append(mtusb_device.strip()) # Clean the string
@@ -1511,7 +1527,7 @@ def mlxcables_options_handler():
     res = ''
     mst_device_filter = None
     if device_filter:
-        st, mst_status_output = get_status_output("mst status -v | grep '%s'" % device_filter)
+        st, mst_status_output = get_mst_status_grep(verbose=True)
         if st == 0:
             # Extract MST device name from output: /dev/mst/mt4123_pciconf0 -> mt4123_pciconf0
             # Format: "ConnectX6(rev:0)    /dev/mst/mt4123_pciconf0    3b:00.0"
@@ -1815,7 +1831,7 @@ def mstcommand_d_handler(command,pcie_debug = False):
         suffix_list = [" --port_type PCIE -c -e"]
 
     command_result = ""
-    mst_status_rs, mst_status_output = get_status_output("mst status | grep '%s'" % device_filter)
+    mst_status_rs, mst_status_output = get_mst_status_grep()
     # PCIe ports
     for pci_device in pci_devices:
         is_valid_mft_tools_dev = is_valid_mft_tools_device(pci_device["name"])
@@ -1882,8 +1898,7 @@ def _get_fw_ctl_device(card, mft_installed):
     if not card:
         return None
     card = card.strip()
-    cmd = "mst status -v" if mft_installed else "mstdevices_info -v"
-    st, res = get_status_output(cmd)
+    st, res = get_mst_status(verbose=True) if mft_installed else get_status_output("mstdevices_info -v")
     if st != 0:
         return None
     # Exact match on all lines first; short BDF is a fallback (it can match another domain).
@@ -2278,7 +2293,7 @@ def mst_func_handler():
             mstregdump_out.append("There are no MTUSB devices.\n")
         else:
             all_devices += mtusb_devices
-    mst_status_rs, mst_status_output = get_status_output("mst status  | grep '%s'" % device_filter)
+    mst_status_rs, mst_status_output = get_mst_status_grep()
     temp = '_run_'
 
     cards_port_dict = {}
@@ -2346,7 +2361,7 @@ def doca_pcc_counter_handler():
     and returns HTML text for output with clickable links for each device.
     """
     devices = []
-    st, mst_output = get_status_output("mst status -v | grep '%s'" % device_filter)
+    st, mst_output = get_mst_status_grep(verbose=True)
     if st != 0:
         return 1,"<p>Error: Failed to get devices. {}</p>".format(mst_output)
 
@@ -2711,7 +2726,7 @@ def pci_bus_handler():
 def mlxreg_handler():
     res = ""
     if mst_devices_exist:
-        _, mst_status_output = get_status_output("mst status | grep '%s'" % device_filter)
+        _, mst_status_output = get_mst_status_grep()
         mst_devices = os.listdir("/dev/mst")
         if interfaces_flag:
             mst_devices = specific_mst_devices
@@ -3309,7 +3324,10 @@ def add_command_if_exists(command):
             print_err_flag = 1
             result = "No team interfaces found"
     elif "mst status" in command:
-        status, result = get_status_output(command)
+        if command in ("mst status", "mst status -v"):
+            status, result = get_mst_status(verbose=(command == "mst status -v"))
+        else:
+            status, result = get_status_output(command)
         if status != 0:
             print_err_flag = 1
             if not result:
@@ -6172,6 +6190,7 @@ def load_modules():
         get_status_output("mst cable add --with_ib > /dev/null 2>&1", timeout="30")
     else:
         get_status_output("mst cable add > /dev/null 2>&1", timeout="30")
+    mst_status_cache.clear() # devices may have changed after mst start / cable add
 
     if os.path.isdir('/dev/mst'):
         mst_devices_exist = True
@@ -6439,8 +6458,7 @@ def parse_interfaces_handler(interfaces):
     pcidev2mstdev_mapping = {}
     mst2cabledev_mapping = {}
     # map mst devices to RDMA , and cable devices to mst
-    cmd = "mst status -v | grep '%s'" % device_filter
-    st, ibdev2mstdev_result = get_status_output(cmd)
+    st, ibdev2mstdev_result = get_mst_status_grep(verbose=True)
     if st == 0:
         ibdev2mstdev_result = re.split("-----+",ibdev2mstdev_result)
         if(len(ibdev2mstdev_result) > 2):
